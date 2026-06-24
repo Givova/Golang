@@ -1,0 +1,14 @@
+{
+  "editor.codeLens": true,
+  "go.enableCodeLens": {
+    "runtest": true,
+    "debugtest": true
+  },
+  "go.toolsManagement.autoUpdate": true,
+  "gopls": {
+    "ui.codelenses": {
+      "test": true,
+      "tidy": true
+    }
+  }
+}
