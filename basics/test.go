@@ -4,7 +4,7 @@ import (
 	"fmt"
 )
 
-func main() {
+func bas() {
 	x:=2
 	if x % 2 == 0 {
 		fmt.Println( x, "- четное число")
