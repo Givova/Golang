@@ -1,0 +1,83 @@
+🧑‍💻 Полнотекстовый поиск PostgreSQL через GORM
+
+Когда в приложении на Go с GORM появляется поиск по тексту, первым в код обычно попадает LIKE '%слово%'. На небольшой таблице это терпимо. Дальше начинаются проблемы. Запрос сканирует всю таблицу, не понимает словоформы, чувствителен к регистру, а обычный индекс ему не помогает. 
+
+В PostgreSQL для таких задач есть встроенный полнотекстовый поиск на tsvector и tsquery. GORM с ним работает без отдельных библиотек, потому что нужные операторы можно передать внутрь .Where().
+
+Как это устроено
+
+Тип tsvector — это нормализованный набор лексем из текста. Функция to_tsvector приводит слова к основе и выкидывает стоп-слова, поэтому запрос по слову running находит документ со словом run. Тип tsquery описывает сам поисковый запрос. 
+
+Функция plainto_tsquery берёт строку от пользователя и превращает её в запрос, безопасно игнорируя спецсимволы вроде & и |. Оператор @@ проверяет, совпадает ли вектор с запросом, и возвращает булево значение.
+
+Базовый вариант
+
+Проще всего собрать условие прямо в .Where(). Модель и функция поиска выглядят так:
+package main
+
+import (
+    "gorm.io/driver/postgres"
+    "gorm.io/gorm"
+)
+
+type Product struct {
+    ID          uint `gorm:"primaryKey"`
+    Title       string
+    Description string
+}
+
+func SearchProducts(db *gorm.DB, term string) ([]Product, error) {
+    var products []Product
+    err := db.Where(
+        "to_tsvector('english', title || ' ' || description) @@ plainto_tsquery('english', ?)",
+        term,
+    ).Find(&products).Error
+    return products, err
+}
+
+Здесь title и description склеиваются в один вектор, а ввод пользователя уходит параметром через ?, так что про SQL-инъекции можно не беспокоиться. Минус подхода в том, что вектор считается заново для каждой строки в момент запроса. Индекс тут не используется, и на большой таблице это становится медленно.
+
+Быстрый вариант с отдельным столбцом и GIN-индексом
+
+Чтобы не пересчитывать вектор на лету, его хранят в отдельном столбце и ускоряют индексом типа GIN. Столбец удобно сделать генерируемым, тогда PostgreSQL сам поддерживает его в актуальном состоянии при любой вставке или обновлении.
+
+В модели этот столбец помечается как доступный только для чтения. Тег -> говорит GORM не пытаться писать в него, ведь значение вычисляет база:
+type Book struct {
+    ID           uint   `gorm:"primaryKey"`
+    Title        string
+    Description  string
+    SearchVector string `gorm:"->;type:tsvector"`
+}
+
+Сам генерируемый столбец и индекс создаются сырым SQL после AutoMigrate, потому что синтаксис генерируемых столбцов GORM через теги не выразит:
+func InitDatabase(db *gorm.DB) {
+    db.AutoMigrate(&Book{})
+
+    db.Exec(`
+        ALTER TABLE books
+        ADD COLUMN IF NOT EXISTS search_vector tsvector
+        GENERATED ALWAYS AS (
+            to_tsvector('english', coalesce(title, '')) ||
+            to_tsvector('english', coalesce(description, ''))
+        ) STORED;
+    `)
+
+    db.Exec(`
+        CREATE INDEX IF NOT EXISTS idx_books_search_vector
+        ON books USING gin(search_vector);
+    `)
+}
+
+Запрос теперь обращается к готовому столбцу, поэтому нагрузка не растёт вместе с размером таблицы:
+func FastSearch(db *gorm.DB, term string) ([]Book, error) {
+    var results []Book
+    err := db.Where("search_vector @@ websearch_to_tsquery('english', ?)", term).
+        Find(&results).Error
+    return results, err
+}
+
+Здесь вместо plainto_tsquery стоит websearch_to_tsquery. Он понимает привычный по поисковикам синтаксис. Кавычки задают точную фразу, а минус перед словом исключает его из выдачи. Для строки поиска от пользователя это обычно удобнее.
+
+Что выбрать
+
+Для прототипа или небольшой таблицы хватит базового варианта через to_tsvector прямо в .Where(). Как только объём данных растёт и поиск начинает тормозить, переходите на генерируемый столбец с GIN-индексом. Логика запроса при этом почти не меняется, а скорость перестаёт зависеть от размера таблицы.
